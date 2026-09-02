@@ -105,6 +105,15 @@ namespace HudNative
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
         [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+        [DllImport("psapi.dll")] static extern int EmptyWorkingSet(IntPtr h);
+
+        // this sits idle most of the day: hand the pages back rather than squat on them
+        public static void TrimMemory()
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            EmptyWorkingSet(System.Diagnostics.Process.GetCurrentProcess().Handle);
+        }
         [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
         [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr h, int i, IntPtr v);
 
@@ -1357,6 +1366,17 @@ $PollTimer.add_Tick({
     } catch { Log "poll error: $_`n$($_.InvocationInfo.PositionMessage)" }
 })
 $PollTimer.Start()
+
+# release idle pages: once shortly after startup, then whenever the panel has been
+# quiet for a while. Keeps a background utility from squatting on ~100 MB it is not using.
+$script:TrimTimer = New-Object System.Windows.Threading.DispatcherTimer
+$TrimTimer.Interval = [TimeSpan]::FromSeconds(20)
+$TrimTimer.add_Tick({
+    $script:TrimTimer.Interval = [TimeSpan]::FromMinutes(3)
+    if ($script:HudWin.IsKeyboardFocusWithin -or $script:HudWin.IsMouseOver) { return }
+    try { [HudNative.Native]::TrimMemory() } catch {}
+})
+$TrimTimer.Start()
 
 # --- run ---------------------------------------------------------------------
 $script:App = New-Object System.Windows.Application
