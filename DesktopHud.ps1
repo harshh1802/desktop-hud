@@ -174,7 +174,7 @@ function Get-DesktopName([guid]$g) {
 }
 
 # --- state -------------------------------------------------------------------
-$script:State = @{ settings = @{ pill = $false; hudOpacity = 0.95; hudX = $null; hudY = $null }; desktops = @{} }
+$script:State = @{ settings = @{ pill = $false; showDone = $false; hudOpacity = 0.95; hudX = $null; hudY = $null }; desktops = @{} }
 
 function Load-State {
     if (-not (Test-Path $NotesPath)) { return }
@@ -182,6 +182,7 @@ function Load-State {
         $j = Get-Content -Path $NotesPath -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($j.settings) {
             if ($null -ne $j.settings.pill) { $script:State.settings.pill = [bool]$j.settings.pill }
+            if ($null -ne $j.settings.showDone) { $script:State.settings.showDone = [bool]$j.settings.showDone }
             if ($j.settings.hudOpacity) { $script:State.settings.hudOpacity = [double]$j.settings.hudOpacity }
             if ($null -ne $j.settings.hudX -and $null -ne $j.settings.hudY) {
                 $script:State.settings.hudX = [double]$j.settings.hudX
@@ -457,6 +458,8 @@ $hudXaml = @"
                         Opacity="0.25" VerticalAlignment="Center" Margin="12,0,0,0">
               <Slider x:Name="HudOpacity" Style="{StaticResource HudSlider}" Width="64"
                       Minimum="0.3" Maximum="1.0" Margin="0,0,8,0" ToolTip="Overlay opacity"/>
+              <Button x:Name="HudEye" Style="{StaticResource GlyphBtn}" FontFamily="Segoe MDL2 Assets"
+                      Content="&#xE7B3;" FontSize="13" ToolTip="Show completed tasks"/>
               <Button x:Name="HudEdit" Style="{StaticResource GlyphBtn}" Content="&#x270E;"
                       FontSize="13" ToolTip="Edit right here"/>
               <Button x:Name="HudClose" Style="{StaticResource GlyphBtn}" Content="&#x2715;"
@@ -545,7 +548,10 @@ $HudWin.FindName('HudClose').add_Click({
 })
 $script:HudEditBtn = $HudWin.FindName('HudEdit')
 $script:HudThemeBox = $HudWin.FindName('HudThemeBox')
+$script:HudRoot = $HudWin.FindName('HudRoot')
+$script:HudEyeBtn = $HudWin.FindName('HudEye')
 $script:HudEditBtn.add_Click({ Toggle-HudEdit })
+$script:HudEyeBtn.add_Click({ Toggle-ShowDone })
 $HudWin.add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape' -and $script:HudEditMode) { Toggle-HudEdit } })
 # drag anywhere on the panel background; controls handle their own clicks first
 $HudWin.add_MouseLeftButtonDown({
@@ -572,6 +578,15 @@ $HudWin.add_MouseLeave({
 
 # --- HUD show / hide ---------------------------------------------------------
 $script:CurrentGuid = [guid]::Empty
+
+$script:UndoData = $null
+$script:UndoTimer = New-Object System.Windows.Threading.DispatcherTimer
+$UndoTimer.Interval = [TimeSpan]::FromSeconds(8)
+$UndoTimer.add_Tick({
+    $script:UndoTimer.Stop()
+    $script:UndoData = $null
+    if ($script:HudWin.IsVisible) { [void](Render-HudContent) }
+})
 
 $script:HoldTimer = New-Object System.Windows.Threading.DispatcherTimer
 $HoldTimer.Interval = [TimeSpan]::FromMilliseconds(3500)
@@ -683,16 +698,99 @@ function Complete-HudTask($cb) {
     if ((Get-PendingCount $note) -eq 0 -and -not $script:HudEditMode) { $script:HoldTimer.Start() }
 }
 
+# --- undo (single-level, for destructive actions) ----------------------------
+function Set-HudUndo($data, [string]$label) {
+    $data.label = $label
+    $data.guid = $script:CurrentGuid
+    $script:UndoData = $data
+    $script:UndoTimer.Stop()
+    $script:UndoTimer.Start()
+}
+
+function Invoke-HudUndo {
+    $u = $script:UndoData
+    $script:UndoData = $null
+    $script:UndoTimer.Stop()
+    if (-not $u -or $u.guid -ne $script:CurrentGuid) { [void](Render-HudContent); return }
+    $note = Get-Note $script:CurrentGuid
+    switch ($u.type) {
+        'task' {
+            if ($u.sec -lt @($note.sections).Count) {
+                $tasks = [System.Collections.ArrayList]@($note.sections[$u.sec].tasks)
+                $idx = [math]::Min([math]::Max($u.idx, 0), $tasks.Count)
+                $tasks.Insert($idx, $u.text)
+                $note.sections[$u.sec].tasks = @($tasks)
+            }
+        }
+        'section' {
+            $secs = [System.Collections.ArrayList]@($note.sections)
+            if ($secs.Count -eq 1 -and -not ([string]$secs[0].title).Trim() -and @($secs[0].tasks).Count -eq 0) {
+                $secs.RemoveAt(0)
+            }
+            $idx = [math]::Min([math]::Max($u.idx, 0), $secs.Count)
+            $secs.Insert($idx, $u.data)
+            $note.sections = @($secs)
+        }
+        'cleardone' {
+            foreach ($k in $u.map.Keys) {
+                if ($k -lt @($note.sections).Count) {
+                    $note.sections[$k].tasks = @(@($note.sections[$k].tasks) + @($u.map[$k]))
+                }
+            }
+        }
+    }
+    Set-HudNote $note
+    [void](Render-HudContent)
+}
+
+function Clear-DoneTasks {
+    Persist-HudEdits
+    $note = Get-Note $script:CurrentGuid
+    $removed = @{}
+    for ($i = 0; $i -lt @($note.sections).Count; $i++) {
+        $keep = @()
+        $gone = @()
+        foreach ($t in @($note.sections[$i].tasks)) {
+            if ($t -and ([string]$t).TrimStart().StartsWith('x ')) { $gone += $t } else { $keep += $t }
+        }
+        if ($gone.Count) { $removed[$i] = $gone }
+        $note.sections[$i].tasks = $keep
+    }
+    if ($removed.Count -eq 0) { return }
+    Set-HudNote $note
+    Set-HudUndo @{ type = 'cleardone'; map = $removed } 'Completed tasks cleared'
+    [void](Render-HudContent)
+}
+
+# --- show-completed setting --------------------------------------------------
+function Update-ShowDoneUi {
+    if ($script:State.settings.showDone) { $script:HudEyeBtn.Foreground = $script:AccentBrushObj }
+    else { $script:HudEyeBtn.Foreground = New-Brush 0x9A 0x98 0xA4 }
+    if ($script:TrayShowDone) { $script:TrayShowDone.Checked = [bool]$script:State.settings.showDone }
+}
+
+function Toggle-ShowDone {
+    $script:State.settings.showDone = -not $script:State.settings.showDone
+    Save-State
+    Update-ShowDoneUi
+    if ($script:HudWin.IsVisible) { [void](Render-HudContent) }
+}
+
 function Remove-HudTask([int]$sec, [string]$txt) {
     $note = Get-Note $script:CurrentGuid
     if ($sec -ge @($note.sections).Count) { return }
     $tasks = [System.Collections.ArrayList]@($note.sections[$sec].tasks)
     for ($i = 0; $i -lt $tasks.Count; $i++) {
-        if (([string]$tasks[$i]).TrimStart() -eq $txt) { $tasks.RemoveAt($i); break }
+        if (([string]$tasks[$i]).TrimStart() -eq $txt) {
+            $raw = [string]$tasks[$i]
+            $tasks.RemoveAt($i)
+            $note.sections[$sec].tasks = @($tasks)
+            Set-HudNote $note
+            Set-HudUndo @{ type = 'task'; sec = $sec; idx = $i; text = $raw } 'Task deleted'
+            [void](Render-HudContent)
+            return
+        }
     }
-    $note.sections[$sec].tasks = @($tasks)
-    Set-HudNote $note
-    [void](Render-HudContent)
 }
 
 function Add-HudTask([int]$sec) {
@@ -726,11 +824,54 @@ function Remove-HudSection([int]$sec) {
     Persist-HudEdits
     $note = Get-Note $script:CurrentGuid
     $secs = [System.Collections.ArrayList]@($note.sections)
-    if ($sec -lt $secs.Count) { $secs.RemoveAt($sec) }
+    if ($sec -ge $secs.Count) { return }
+    $data = $secs[$sec]
+    $secs.RemoveAt($sec)
     if ($secs.Count -eq 0) { [void]$secs.Add(@{ title = ''; tasks = @() }) }
     $note.sections = @($secs)
     Set-HudNote $note
+    Set-HudUndo @{ type = 'section'; idx = $sec; data = $data } 'Section deleted'
     [void](Render-HudContent)
+}
+
+# one task row: [delete (edit mode)][checkbox + text]
+function New-HudTaskRow([int]$si, [string]$raw, [bool]$done) {
+    $trimmed = $raw.TrimStart()
+    $text = if ($done) { $trimmed.Substring(2) } else { $trimmed }
+
+    $row = New-Object System.Windows.Controls.DockPanel
+    $row.Margin = New-Object System.Windows.Thickness(0, 1, 0, 0)
+
+    $del = New-Object System.Windows.Controls.Button
+    $del.Style = $script:HudWin.Resources['GlyphBtn']
+    $del.Content = [string][char]0x2715
+    $del.FontSize = 10
+    $del.Width = 22
+    $del.Height = 22
+    $del.VerticalAlignment = 'Center'
+    $del.ToolTip = 'Delete task'
+    $del.Tag = @{ sec = $si; text = $trimmed }
+    $del.Visibility = if ($script:HudEditMode) { 'Visible' } else { 'Collapsed' }
+    $del.add_Click({ param($s, $e) Remove-HudTask ([int]$s.Tag.sec) ([string]$s.Tag.text) })
+    [System.Windows.Controls.DockPanel]::SetDock($del, 'Right')
+
+    $cb = New-Object System.Windows.Controls.CheckBox
+    $cb.Style = $script:HudWin.Resources['HudCheck']
+    $cb.BorderBrush = $script:AccentBrushObj
+    $cb.IsChecked = $done
+    $cb.Tag = @{ sec = $si; text = $text }
+    $tbx = New-Object System.Windows.Controls.TextBlock
+    $tbx.Text = $text
+    $tbx.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Variable Text, Segoe UI')
+    $tbx.FontSize = 14
+    $tbx.TextWrapping = 'Wrap'
+    $cb.Content = $tbx
+    Set-DoneStyle $cb
+    $cb.add_Click({ param($s, $e) Complete-HudTask $s })
+
+    [void]$row.Children.Add($del)
+    [void]$row.Children.Add($cb)
+    return $row
 }
 
 # rebuilds the HUD content (sections, tasks, edit-mode widgets); returns the pending count
@@ -787,39 +928,28 @@ function Render-HudContent {
         }
 
         $pending = @(@($sec.tasks) | Where-Object { $_ -and -not ([string]$_).TrimStart().StartsWith('x ') })
+        $doneTasks = @(@($sec.tasks) | Where-Object { $_ -and ([string]$_).TrimStart().StartsWith('x ') })
         foreach ($t in $pending) {
-            $row = New-Object System.Windows.Controls.DockPanel
-            $row.Margin = New-Object System.Windows.Thickness(0, 1, 0, 0)
-
-            $del = New-Object System.Windows.Controls.Button
-            $del.Style = $glyphStyle
-            $del.Content = [string][char]0x2715
-            $del.FontSize = 10
-            $del.Width = 22
-            $del.Height = 22
-            $del.VerticalAlignment = 'Center'
-            $del.ToolTip = 'Delete task'
-            $del.Tag = @{ sec = $si; text = ([string]$t).TrimStart() }
-            $del.Visibility = if ($script:HudEditMode) { 'Visible' } else { 'Collapsed' }
-            $del.add_Click({ param($s, $e) Remove-HudTask ([int]$s.Tag.sec) ([string]$s.Tag.text) })
-            [System.Windows.Controls.DockPanel]::SetDock($del, 'Right')
-
-            $cb = New-Object System.Windows.Controls.CheckBox
-            $cb.Style = $checkStyle
-            $cb.BorderBrush = $accentBrush
-            $cb.Tag = @{ sec = $si; text = ([string]$t).TrimStart() }
-            $tbx = New-Object System.Windows.Controls.TextBlock
-            $tbx.Text = ([string]$t).TrimStart()
-            $tbx.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Variable Text, Segoe UI')
-            $tbx.FontSize = 14
-            $tbx.TextWrapping = 'Wrap'
-            $cb.Content = $tbx
-            Set-DoneStyle $cb
-            $cb.add_Click({ param($s, $e) Complete-HudTask $s })
-
-            [void]$row.Children.Add($del)
-            [void]$row.Children.Add($cb)
-            [void]$script:HudTasks.Children.Add($row)
+            [void]$script:HudTasks.Children.Add((New-HudTaskRow $si ([string]$t) $false))
+        }
+        if ($script:State.settings.showDone) {
+            foreach ($t in $doneTasks) {
+                [void]$script:HudTasks.Children.Add((New-HudTaskRow $si ([string]$t) $true))
+            }
+        }
+        # a saved section with nothing pending should not look like it vanished
+        if (-not $script:HudEditMode -and $pending.Count -eq 0 -and
+            (([string]$sec.title).Trim() -or $secs.Count -gt 1) -and
+            -not ($script:State.settings.showDone -and $doneTasks.Count -gt 0)) {
+            $es = New-Object System.Windows.Controls.TextBlock
+            $es.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Variable Text, Segoe UI')
+            $es.FontSize = 12
+            $es.FontStyle = 'Italic'
+            $es.Opacity = 0.7
+            $es.Foreground = New-Brush 0x9A 0x98 0xA4
+            $es.Margin = New-Object System.Windows.Thickness(6, 3, 0, 0)
+            $es.Text = if ($doneTasks.Count -gt 0) { "all done $([char]0x2713)" } else { 'no tasks yet' }
+            [void]$script:HudTasks.Children.Add($es)
         }
 
         if ($script:HudEditMode) {
@@ -846,13 +976,65 @@ function Render-HudContent {
     }
 
     if ($script:HudEditMode) {
+        $erow = New-Object System.Windows.Controls.StackPanel
+        $erow.Orientation = 'Horizontal'
+        $erow.Margin = New-Object System.Windows.Thickness(0, 12, 0, 0)
         $sbtn = New-Object System.Windows.Controls.Button
         $sbtn.Style = $softStyle
         $sbtn.Content = '+ section'
-        $sbtn.HorizontalAlignment = 'Left'
-        $sbtn.Margin = New-Object System.Windows.Thickness(0, 12, 0, 0)
         $sbtn.add_Click({ Add-HudSection })
-        [void]$script:HudTasks.Children.Add($sbtn)
+        [void]$erow.Children.Add($sbtn)
+        $anyDone = $false
+        foreach ($s in $secs) {
+            foreach ($t in @($s.tasks)) {
+                if ($t -and ([string]$t).TrimStart().StartsWith('x ')) { $anyDone = $true }
+            }
+        }
+        if ($anyDone) {
+            $cbtn = New-Object System.Windows.Controls.Button
+            $cbtn.Style = $softStyle
+            $cbtn.Content = 'clear completed'
+            $cbtn.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
+            $cbtn.ToolTip = 'Delete all completed tasks (undoable)'
+            $cbtn.add_Click({ Clear-DoneTasks })
+            [void]$erow.Children.Add($cbtn)
+        }
+        [void]$script:HudTasks.Children.Add($erow)
+        $hint = New-Object System.Windows.Controls.TextBlock
+        $hint.Text = 'changes save automatically'
+        $hint.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Variable Text, Segoe UI')
+        $hint.FontSize = 10
+        $hint.FontStyle = 'Italic'
+        $hint.Opacity = 0.7
+        $hint.Foreground = New-Brush 0x9A 0x98 0xA4
+        $hint.Margin = New-Object System.Windows.Thickness(6, 8, 0, 0)
+        [void]$script:HudTasks.Children.Add($hint)
+    }
+
+    if ($script:UndoData -and $script:UndoData.guid -eq $script:CurrentGuid) {
+        $ub = New-Object System.Windows.Controls.Border
+        $ub.Background = New-Object System.Windows.Media.SolidColorBrush(
+            [System.Windows.Media.Color]::FromArgb(0x22, 0xFF, 0xFF, 0xFF))
+        $ub.CornerRadius = New-Object System.Windows.CornerRadius(8)
+        $ub.Margin = New-Object System.Windows.Thickness(0, 12, 0, 0)
+        $ub.Padding = New-Object System.Windows.Thickness(10, 4, 4, 4)
+        $ud = New-Object System.Windows.Controls.DockPanel
+        $ubtn = New-Object System.Windows.Controls.Button
+        $ubtn.Style = $softStyle
+        $ubtn.Content = 'Undo'
+        $ubtn.add_Click({ Invoke-HudUndo })
+        [System.Windows.Controls.DockPanel]::SetDock($ubtn, 'Right')
+        $ul = New-Object System.Windows.Controls.TextBlock
+        $ul.Text = [string]$script:UndoData.label
+        $ul.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Variable Text, Segoe UI')
+        $ul.FontSize = 12
+        $ul.Foreground = New-Brush 0x9A 0x98 0xA4
+        $ul.VerticalAlignment = 'Center'
+        $ul.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+        [void]$ud.Children.Add($ubtn)
+        [void]$ud.Children.Add($ul)
+        $ub.Child = $ud
+        [void]$script:HudTasks.Children.Add($ub)
     }
 
     Update-HudProgress
@@ -870,6 +1052,7 @@ function Toggle-HudEdit {
         $script:HudThemeBox.Visibility = 'Visible'
         $script:HudEditBtn.Content = [string][char]0x2713
         $script:HudEditBtn.ToolTip = 'Done editing'
+        $script:HudRoot.BorderBrush = $script:AccentBrushObj
         [void](Render-HudContent)
         $script:HudWin.Activate()
         if ($script:HudAddBoxes.Count) { [void]$script:HudAddBoxes[0].Focus() }
@@ -883,6 +1066,8 @@ function Toggle-HudEdit {
         $script:HudThemeBox.Visibility = 'Collapsed'
         $script:HudEditBtn.Content = [string][char]0x270E
         $script:HudEditBtn.ToolTip = 'Edit right here'
+        $script:HudRoot.BorderBrush = New-Object System.Windows.Media.SolidColorBrush(
+            [System.Windows.Media.Color]::FromArgb(0x26, 0xFF, 0xFF, 0xFF))
         [HudNative.Native]::SetNoActivate($script:HudHandle, $true)
         Update-Pill
         $pendingLeft = Render-HudContent
@@ -1011,11 +1196,15 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
     Save-State
     Update-Pill
 })
+$script:TrayShowDone = New-Object System.Windows.Forms.ToolStripMenuItem('Show completed tasks')
+$TrayShowDone.add_Click({ Toggle-ShowDone })
+[void]$menu.Items.Add($TrayShowDone)
 [void]$menu.Items.Add('Open notes folder', $null, { Start-Process explorer.exe $ScriptDir })
 [void]$menu.Items.Add('-')
 [void]$menu.Items.Add('Exit', $null, { $script:App.Shutdown() })
 $Tray.ContextMenuStrip = $menu
 $Tray.add_DoubleClick({ Open-HudEditor })
+Update-ShowDoneUi
 
 # --- desktop switch polling --------------------------------------------------
 $script:PollTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1026,6 +1215,7 @@ $PollTimer.add_Tick({
         if ($g -ne [guid]::Empty -and $g -ne $script:CurrentGuid) {
             # leaving a desktop while inline-editing: save against the old desktop first
             if ($script:HudEditMode) { Toggle-HudEdit }
+            $script:UndoData = $null
             $script:CurrentGuid = $g
             Update-Pill
             Show-Hud

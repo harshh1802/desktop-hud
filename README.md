@@ -21,9 +21,16 @@ and WPF that ship with Windows.
 - **Tick tasks on the overlay**: real checkboxes right on the panel; tick to mark done
   (strikethrough, saved instantly), untick to undo. A done/total progress bar tracks
   the day.
+- **Completed tasks, your way**: the eye button (or tray menu) toggles whether done
+  tasks stay visible, struck through under each section, or disappear from view. A
+  "clear completed" action in edit mode sweeps them away when you are ready.
+- **Undo for every deletion**: deleting a task, a section, or clearing completed shows
+  an Undo strip on the panel for a few seconds. Nothing is lost to a stray click.
 - **Inline editing**: click the pencil (or press `Win+Shift+N`) and the panel itself
   becomes the editor: rename the theme and sections, add tasks (Enter), delete tasks,
-  add or remove sections. No separate window.
+  add or remove sections. No separate window. The border glows in the desktop's accent
+  color while editing, and sections with nothing pending say so ("all done ✓") instead
+  of disappearing.
 - **Stays out of your way**: never steals keyboard focus (except while you are typing
   in edit mode), no Alt-Tab entry, header controls fade in only on hover, and the
   panel pauses its auto-fade while your mouse is over it.
