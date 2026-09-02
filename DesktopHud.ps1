@@ -1,9 +1,9 @@
 # Desktop HUD: per-virtual-desktop context overlay.
 # Shows a transient HUD (desktop name + theme + tasks) whenever you switch virtual desktops,
-# plus an optional tiny always-visible "anchor pill". Notes are keyed by desktop GUID.
+# The panel collapses to a single line when idle. Notes are keyed by desktop GUID.
 # Built on stable surfaces only: VirtualDesktops registry + documented IVirtualDesktopManager COM.
 #
-# Hotkeys:  Win+Shift+N quick-add task   Win+Shift+H show panel   Win+Shift+B toggle pill
+# Hotkeys:  Win+Shift+N quick-add task   Win+Shift+H show panel   Win+Shift+B collapse/expand
 # Usage:    DesktopHud.bat (hidden)  |  -Install / -Uninstall (Startup shortcut)  |  -SelfTest / -SmokeTest
 
 param(
@@ -183,14 +183,14 @@ function Get-DesktopName([guid]$g) {
 }
 
 # --- state -------------------------------------------------------------------
-$script:State = @{ settings = @{ pill = $false; showDone = $false; hudOpacity = 0.95; hudX = $null; hudY = $null }; desktops = @{} }
+$script:State = @{ settings = @{ collapsed = $false; showDone = $false; hudOpacity = 0.95; hudX = $null; hudY = $null }; desktops = @{} }
 
 function Load-State {
     if (-not (Test-Path $NotesPath)) { return }
     try {
         $j = Get-Content -Path $NotesPath -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($j.settings) {
-            if ($null -ne $j.settings.pill) { $script:State.settings.pill = [bool]$j.settings.pill }
+            if ($null -ne $j.settings.collapsed) { $script:State.settings.collapsed = [bool]$j.settings.collapsed }
             if ($null -ne $j.settings.showDone) { $script:State.settings.showDone = [bool]$j.settings.showDone }
             if ($j.settings.hudOpacity) { $script:State.settings.hudOpacity = [double]$j.settings.hudOpacity }
             if ($null -ne $j.settings.hudX -and $null -ne $j.settings.hudY) {
@@ -533,7 +533,21 @@ $hudXaml = @"
         </Grid.ColumnDefinitions>
         <Border x:Name="HudAccentBar" Grid.Column="0" Width="4" Background="#5BA8E0"
                 CornerRadius="2" Margin="10,16,0,16"/>
-        <StackPanel Grid.Column="1" Margin="14,14,16,16">
+        <Grid Grid.Column="1">
+          <!-- collapsed form: one readable line, click anywhere on it to expand -->
+          <StackPanel x:Name="HudMini" Orientation="Horizontal" Visibility="Collapsed"
+                      Margin="12,9,16,9" VerticalAlignment="Center">
+            <TextBlock x:Name="HudMiniName" FontFamily="Segoe UI Variable Text, Segoe UI"
+                       FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource Ink}"
+                       VerticalAlignment="Center"/>
+            <TextBlock x:Name="HudMiniTheme" FontFamily="Segoe UI Variable Text, Segoe UI"
+                       FontSize="13" Foreground="{StaticResource InkMuted}" MaxWidth="320"
+                       TextTrimming="CharacterEllipsis" Margin="9,0,0,0" VerticalAlignment="Center"/>
+            <TextBlock x:Name="HudMiniCount" FontFamily="Segoe UI Variable Text, Segoe UI"
+                       FontSize="12" Foreground="{StaticResource InkMuted}"
+                       Margin="16,0,0,0" VerticalAlignment="Center"/>
+          </StackPanel>
+        <StackPanel x:Name="HudFull" Margin="14,14,16,16">
           <Grid>
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="*"/>
@@ -550,6 +564,8 @@ $hudXaml = @"
                         Opacity="0.25" VerticalAlignment="Center" Margin="12,0,0,0">
               <Slider x:Name="HudOpacity" Style="{StaticResource HudSlider}" Width="64"
                       Minimum="0.3" Maximum="1.0" Margin="0,0,8,0" ToolTip="Overlay opacity"/>
+              <Button x:Name="HudCollapse" Style="{StaticResource GlyphBtn}" FontFamily="Segoe MDL2 Assets"
+                      Content="&#xE921;" FontSize="12" ToolTip="Collapse to a single line"/>
               <Button x:Name="HudEye" Style="{StaticResource GlyphBtn}" FontFamily="Segoe MDL2 Assets"
                       Content="&#xE7B3;" FontSize="13" ToolTip="Show completed tasks"/>
               <Button x:Name="HudClose" Style="{StaticResource GlyphBtn}" Content="&#x2715;"
@@ -570,21 +586,10 @@ $hudXaml = @"
             <StackPanel x:Name="HudTasks" Margin="0,8,0,0"/>
           </ScrollViewer>
         </StackPanel>
+        </Grid>
       </Grid>
     </Border>
   </Grid>
-</Window>
-"@
-
-$pillXaml = @"
-<Window $xamlNs
-    WindowStyle="None" AllowsTransparency="True" Background="Transparent"
-    Topmost="True" ShowInTaskbar="False" ShowActivated="False"
-    SizeToContent="WidthAndHeight" ResizeMode="NoResize" Opacity="0.45">
-  <Border x:Name="PillBorder" CornerRadius="11" Background="#CC1B1B26" Padding="14,5"
-          BorderBrush="#335BA8E0" BorderThickness="1">
-    <TextBlock x:Name="PillText" FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="12" Foreground="#F5F3EF"/>
-  </Border>
 </Window>
 "@
 
@@ -596,6 +601,12 @@ $script:HudBarGrid = $HudWin.FindName('HudBarGrid')
 $script:HudBarDone = $HudWin.FindName('HudBarDone')
 $script:HudBarLeft = $HudWin.FindName('HudBarLeft')
 $script:HudCtrls = $HudWin.FindName('HudCtrls')
+$script:HudFull = $HudWin.FindName('HudFull')
+$script:HudMini = $HudWin.FindName('HudMini')
+$script:HudMiniName = $HudWin.FindName('HudMiniName')
+$script:HudMiniTheme = $HudWin.FindName('HudMiniTheme')
+$script:HudMiniCount = $HudWin.FindName('HudMiniCount')
+$script:HudAccentBar = $HudWin.FindName('HudAccentBar')
 $script:HudSlide = $HudWin.FindName('HudSlide')
 $HudWin.Opacity = 0
 # one shared mutable accent brush; mutating its Color recolors every element that uses it
@@ -604,18 +615,12 @@ $script:AccentBrushObj = New-Object System.Windows.Media.SolidColorBrush(
 $HudWin.FindName('HudAccentBar').Background = $script:AccentBrushObj
 $HudWin.FindName('HudBarFill').Background = $script:AccentBrushObj
 
-$script:PillWin = [System.Windows.Markup.XamlReader]::Parse($pillXaml)
-$script:PillText = $PillWin.FindName('PillText')
-$script:PillBorder = $PillWin.FindName('PillBorder')
-
 # HUD is fully interactive: it must be able to take focus when you click into a field,
 # so it does NOT carry WS_EX_NOACTIVATE. ShowActivated=False is what keeps it from
-# stealing focus when it merely appears. The pill stays click-through and passive.
+# stealing focus when it merely appears.
 $hudH = (New-Object System.Windows.Interop.WindowInteropHelper($HudWin)).EnsureHandle()
 [HudNative.Native]::SetOverlayStyles($hudH, $false, $false)
 $script:HudHandle = $hudH
-$pillH = (New-Object System.Windows.Interop.WindowInteropHelper($PillWin)).EnsureHandle()
-[HudNative.Native]::SetOverlayStyles($pillH, $true, $true)
 
 $script:HudOpacitySlider = $HudWin.FindName('HudOpacity')
 $HudOpacitySlider.Value = $State.settings.hudOpacity
@@ -636,6 +641,7 @@ $script:HudEyeBtn = $HudWin.FindName('HudEye')
 $script:HudThemeBox.Foreground = $script:AccentBrushObj
 $script:HudThemeBox.CaretBrush = $script:AccentBrushObj
 $script:HudEyeBtn.add_Click({ Toggle-ShowDone })
+$HudWin.FindName('HudCollapse').add_Click({ Set-HudCollapsed $true })
 $script:HudThemeBox.add_LostFocus({ Commit-Theme })
 $script:HudThemeBox.add_KeyDown({
     param($s, $e)
@@ -644,10 +650,18 @@ $script:HudThemeBox.add_KeyDown({
 })
 # drag by the panel background; text fields and buttons consume their own clicks first
 $HudWin.add_MouseLeftButtonDown({
+    $x0 = $script:HudWin.Left
+    $y0 = $script:HudWin.Top
     try { $script:HudWin.DragMove() } catch {}
-    $script:State.settings.hudX = $script:HudWin.Left
-    $script:State.settings.hudY = $script:HudWin.Top
-    Save-State
+    $moved = ([math]::Abs($script:HudWin.Left - $x0) + [math]::Abs($script:HudWin.Top - $y0)) -gt 3
+    if ($moved) {
+        $script:State.settings.hudX = $script:HudWin.Left
+        $script:State.settings.hudY = $script:HudWin.Top
+        Save-State
+    } elseif ($script:State.settings.collapsed) {
+        # a plain click on the collapsed line opens it back up
+        Set-HudCollapsed $false
+    }
 })
 # hovering reveals the header controls and pauses any pending auto-fade
 $HudWin.add_MouseEnter({
@@ -677,9 +691,9 @@ $script:HoldTimer = New-Object System.Windows.Threading.DispatcherTimer
 $HoldTimer.Interval = [TimeSpan]::FromMilliseconds(3500)
 $HoldTimer.add_Tick({
     $script:HoldTimer.Stop()
-    $a = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(600))))
-    $a.add_Completed({ $script:HudWin.Hide() })
-    $script:HudWin.BeginAnimation([System.Windows.Window]::OpacityProperty, $a)
+    # nothing left to do here: shrink to the anchor line rather than disappear,
+    # so the desktop's context stays on screen
+    Set-HudCollapsed $true
 })
 
 function New-Brush([byte]$r, [byte]$g, [byte]$b) {
@@ -763,7 +777,7 @@ function Get-Addr($ctl) {
 # the panel auto-fades only when idle: nothing pending, not hovered, not being typed in
 function Start-IdleFade {
     $script:HoldTimer.Stop()
-    if (-not $script:HudWin.IsVisible) { return }
+    if (-not $script:HudWin.IsVisible -or $script:State.settings.collapsed) { return }
     if ($script:HudWin.IsMouseOver -or $script:HudWin.IsKeyboardFocusWithin) { return }
     if ((Get-PendingCount (Get-Note $script:CurrentGuid)) -ne 0) { return }
     $script:HoldTimer.Start()
@@ -851,7 +865,7 @@ function Commit-Theme {
     $note = Get-Note $script:CurrentGuid
     $note.theme = $script:HudThemeBox.Text.Trim()
     Set-HudNote $note
-    Update-Pill
+    Update-MiniLine
 }
 
 # --- undo (single-level, for destructive actions) ----------------------------
@@ -1229,6 +1243,7 @@ function Show-Hud {
     $script:HudDesktop.Text = Get-DesktopName $script:CurrentGuid
     $script:HudThemeBox.Text = [string]$note.theme
     $pendingCount = Render-HudContent
+    Apply-CollapseLayout
     $script:HoldTimer.Stop()
     $script:HudWin.Show()
     $script:HudWin.UpdateLayout()
@@ -1255,25 +1270,67 @@ function Show-Hud {
     $ease.EasingMode = 'EaseOut'
     $sa.EasingFunction = $ease
     $script:HudSlide.BeginAnimation([System.Windows.Media.TranslateTransform]::YProperty, $sa)
-    # stays visible while tasks are pending; fades only when there is nothing to do
-    if ($pendingCount -eq 0) { $script:HoldTimer.Start() }
+    # stays open while tasks are pending; shrinks to the anchor line when there is nothing to do
+    if ($pendingCount -eq 0 -and -not $script:State.settings.collapsed) { $script:HoldTimer.Start() }
 }
 
-function Update-Pill {
-    if (-not $script:State.settings.pill -or $script:CurrentGuid -eq [guid]::Empty) {
-        $script:PillWin.Hide()
-        return
-    }
+# --- collapsed "anchor line" --------------------------------------------------
+function Update-MiniLine {
+    if ($script:CurrentGuid -eq [guid]::Empty) { return }
     $note = Get-Note $script:CurrentGuid
-    $txt = Get-DesktopName $script:CurrentGuid
-    if ($note.theme) { $txt = "$txt   $([char]0x2022)   $($note.theme)" }
-    $script:PillText.Text = $txt
-    $script:PillBorder.BorderBrush = New-Object System.Windows.Media.SolidColorBrush((Get-AccentColor $script:CurrentGuid))
-    $script:PillWin.Show()
-    $script:PillWin.UpdateLayout()
+    $script:HudMiniName.Text = Get-DesktopName $script:CurrentGuid
+    $script:HudMiniTheme.Text = [string]$note.theme
+    $total = 0
+    $done = 0
+    foreach ($sec in @($note.sections)) {
+        foreach ($t in @($sec.tasks)) {
+            if (-not $t) { continue }
+            $total++
+            if (([string]$t).TrimStart().StartsWith('x ')) { $done++ }
+        }
+    }
+    $script:HudMiniCount.Text = if ($total) { "$done/$total" } else { '' }
+}
+
+# paints whichever form the current setting asks for, without persisting anything
+function Apply-CollapseLayout {
+    if ($script:State.settings.collapsed) {
+        Update-MiniLine
+        $script:HudFull.Visibility = 'Collapsed'
+        $script:HudMini.Visibility = 'Visible'
+        $script:HudAccentBar.Margin = New-Object System.Windows.Thickness(10, 9, 0, 9)
+        $script:HudWin.Cursor = [System.Windows.Input.Cursors]::Hand
+        $script:HudRoot.ToolTip = 'Click to expand'
+    } else {
+        $script:HudMini.Visibility = 'Collapsed'
+        $script:HudFull.Visibility = 'Visible'
+        $script:HudAccentBar.Margin = New-Object System.Windows.Thickness(10, 16, 0, 16)
+        $script:HudWin.Cursor = $null
+        $script:HudRoot.ToolTip = $null
+    }
+    $script:HudWin.UpdateLayout()
+}
+
+function Set-HudCollapsed([bool]$on) {
+    if ($on -and $script:HudWin.IsKeyboardFocusWithin) { [System.Windows.Input.Keyboard]::ClearFocus() }
+    $script:State.settings.collapsed = $on
+    Save-State
+    $script:HoldTimer.Stop()
+    Apply-CollapseLayout
+    if (-not $script:HudWin.IsVisible) { return }
+    # keep the panel anchored by its top-left corner as it changes size
     $wa = [System.Windows.SystemParameters]::WorkArea
-    $script:PillWin.Left = $wa.Left + ($wa.Width - $script:PillWin.ActualWidth) / 2
-    $script:PillWin.Top = $wa.Top + 6
+    if ($script:HudWin.Left + $script:HudWin.ActualWidth -gt $wa.Right) {
+        $script:HudWin.Left = [math]::Max($wa.Left, $wa.Right - $script:HudWin.ActualWidth)
+    }
+    if ($script:HudWin.Top + $script:HudWin.ActualHeight -gt $wa.Bottom) {
+        $script:HudWin.Top = [math]::Max($wa.Top, $wa.Bottom - $script:HudWin.ActualHeight)
+    }
+}
+
+function Toggle-Collapse {
+    if (-not $script:HudWin.IsVisible) { Show-Hud }
+    Set-HudCollapsed (-not [bool]$script:State.settings.collapsed)
 }
 
 # --- task styling ------------------------------------------------------------
@@ -1298,11 +1355,7 @@ $script:HotWin.add_Pressed({
         switch ($id) {
             1 { Open-HudEditor }
             2 { Show-Hud }
-            3 {
-                $script:State.settings.pill = -not $script:State.settings.pill
-                Save-State
-                Update-Pill
-            }
+            3 { Toggle-Collapse }
         }
     } catch { Log "hotkey handler error: $_" }
 })
@@ -1330,11 +1383,7 @@ $Tray.Visible = $true
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$menu.Items.Add('Add task  (Win+Shift+N)', $null, { Open-HudEditor })
 [void]$menu.Items.Add('Show panel  (Win+Shift+H)', $null, { Show-Hud })
-[void]$menu.Items.Add('Toggle pill  (Win+Shift+B)', $null, {
-    $script:State.settings.pill = -not $script:State.settings.pill
-    Save-State
-    Update-Pill
-})
+[void]$menu.Items.Add('Collapse / expand  (Win+Shift+B)', $null, { Toggle-Collapse })
 $script:TrayShowDone = New-Object System.Windows.Forms.ToolStripMenuItem('Show completed tasks')
 $TrayShowDone.add_Click({ Toggle-ShowDone })
 [void]$menu.Items.Add($TrayShowDone)
@@ -1360,7 +1409,7 @@ $PollTimer.add_Tick({
             if ($script:HudWin.IsKeyboardFocusWithin) { [System.Windows.Input.Keyboard]::ClearFocus() }
             $script:UndoData = $null
             $script:CurrentGuid = $g
-            Update-Pill
+            Update-MiniLine
             Show-Hud
         }
     } catch { Log "poll error: $_`n$($_.InvocationInfo.PositionMessage)" }
@@ -1435,6 +1484,20 @@ if ($SmokeTest) {
                     $note = Get-Note $script:CurrentGuid
                     if (@($note.sections).Count -lt 2) { $script:SmokeFail += 'undo did not restore section' }
                 }
+                8 {
+                    Set-HudCollapsed $true
+                    if ($script:HudMini.Visibility -ne 'Visible') { $script:SmokeFail += 'collapsed line not shown' }
+                    if ($script:HudFull.Visibility -ne 'Collapsed') { $script:SmokeFail += 'full panel still shown when collapsed' }
+                    if (-not $script:HudMiniName.Text) { $script:SmokeFail += 'collapsed line has no desktop name' }
+                    if ($script:HudMiniCount.Text -notmatch '^\d+/\d+$') { $script:SmokeFail += "collapsed count wrong: '$($script:HudMiniCount.Text)'" }
+                }
+                9 {
+                    $h = $script:HudWin.ActualHeight
+                    if ($h -gt 90) { $script:SmokeFail += "collapsed panel too tall: $h" }
+                    Set-HudCollapsed $false
+                    if ($script:HudFull.Visibility -ne 'Visible') { $script:SmokeFail += 'expand did not restore panel' }
+                    if (-not $script:State.settings.ContainsKey('collapsed')) { $script:SmokeFail += 'collapsed setting missing' }
+                }
                 default { $script:App.Shutdown() }
             }
         } catch {
@@ -1459,6 +1522,7 @@ try {
     Log 'stopped'
 }
 if ($SmokeTest) {
+    if ($script:SmokeStep -lt 9) { $script:SmokeFail += "only reached step $($script:SmokeStep) of 9" }
     if ($script:SmokeFail -and $script:SmokeFail.Count) {
         Write-Host "SMOKE FAILED:"
         $script:SmokeFail | ForEach-Object { Write-Host "  - $_" }

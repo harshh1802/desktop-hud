@@ -5,8 +5,9 @@ A per-virtual-desktop context overlay for Windows 11, in a single PowerShell scr
 You work across virtual desktops, one per project. Every switch costs you a moment of
 "wait, what was I doing here?". Desktop HUD gives each virtual desktop its own note:
 a one-line theme plus sectioned task checklists. When you switch desktops, a sleek
-panel fades in with that desktop's context. While tasks are pending it stays on
-screen; when there is nothing left to do, it quietly fades away.
+panel fades in with that desktop's context. While tasks are pending it stays open;
+when there is nothing left to do it shrinks to a single unobtrusive line that still
+tells you where you are. Click that line to open it back up.
 
 No install, no dependencies, no Electron: one `.ps1` file running on the PowerShell
 and WPF that ship with Windows.
@@ -33,13 +34,16 @@ and WPF that ship with Windows.
 - **Undo for every deletion**: deleting a task, a section, or clearing completed shows
   an Undo strip on the panel for a few seconds. Emptying a task's text deletes it, also
   undoable. Nothing is lost to a stray click.
-- **Stays out of your way**: never steals keyboard focus (except while you are typing
-  in edit mode), no Alt-Tab entry, header controls fade in only on hover, and the
-  panel pauses its auto-fade while your mouse is over it.
+- **Stays out of your way**: it never takes keyboard focus unless you click into it,
+  no Alt-Tab entry, header controls fade in only on hover, and it will not collapse
+  while your mouse is over it or you are mid-sentence in a field.
 - **Yours to place**: drag it anywhere (position remembered), tune its opacity with
   the hover slider (30 to 100 percent), hide it with the corner ✕.
-- **Optional anchor pill**: a tiny click-through strip at the top of the screen with
-  the current desktop's theme, for when you want an always-on anchor.
+- **Collapses to a line**: the panel has two forms, and the small line is a first-class
+  one, not a separate widget. Collapsed it shows the accent stripe, the desktop name,
+  the theme and your progress in about 26 pixels of height; click anywhere on it to
+  expand. It collapses in place, so nothing jumps around the screen, and it collapses
+  itself once a desktop has nothing pending rather than disappearing on you.
 - **Instant autosave**: every change writes to a local `notes.json` next to the
   script. Nothing leaves your machine.
 - **Light on resources**: it trims its own working set while idle, settling around
@@ -70,7 +74,7 @@ powershell -File DesktopHud.ps1 -Uninstall   # removes it
 |---|---|
 | `Win+Shift+N` | Quick add: show the panel and start typing a task |
 | `Win+Shift+H` | Show the panel for the current desktop |
-| `Win+Shift+B` | Toggle the anchor pill |
+| `Win+Shift+B` | Collapse to the line, or expand again |
 
 Inside the panel: `Enter` commits a task and moves on to the next, `Escape` hands focus
 back to the app you were using, `Tab` moves between fields, and hovering a row reveals
@@ -90,8 +94,7 @@ The tray icon offers the same actions plus Exit; double-click it to add a task.
   absent from Alt-Tab. The panel deliberately does NOT set `WS_EX_NOACTIVATE`, because
   it must be able to take focus when you click into a field; `ShowActivated="False"` is
   what keeps it from stealing focus when it merely appears (verified: showing the panel
-  leaves the foreground window untouched). The pill, which is never typed into, keeps
-  both flags and is click-through (`WS_EX_TRANSPARENT`).
+  leaves the foreground window untouched).
 - UI is WPF with custom control templates (checkboxes, slider, buttons), built and
   driven from PowerShell. The script relaunches itself under Windows PowerShell 5.1
   STA if started from PowerShell 7+.
@@ -108,8 +111,9 @@ powershell -File DesktopHud.ps1 -SmokeTest   # drives the real capture flow, the
 
 `-SmokeTest` runs against a throwaway notes file in `%TEMP%` (it never touches your
 notes) and asserts the whole loop: add a task through the ghost row, confirm the row
-clears, rename the task in place, add and name a section, delete it, and undo the
-delete. It exits non-zero and prints what broke if any step fails.
+clears, rename the task in place, add and name a section, delete it, undo the delete,
+then collapse and expand the panel while checking the line renders correctly. It exits
+non-zero and prints what broke if any step fails.
 
 A minimal log is written to `hud.log` (gitignored). Single instance is enforced with
 a mutex; a second launch exits quietly.
@@ -118,8 +122,8 @@ a mutex; a second launch exits quietly.
 
 Issues and pull requests are welcome. The whole app is one file, `DesktopHud.ps1`,
 organized top to bottom: native interop, desktop primitives, state, XAML + styles,
-rendering, edit mode, hotkeys, tray, main loop. Please keep new code dependency-free
-and on documented Windows surfaces.
+rendering, collapse/expand, hotkeys, tray, main loop. Please keep new code
+dependency-free and on documented Windows surfaces.
 
 ## License
 
