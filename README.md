@@ -18,19 +18,21 @@ and WPF that ship with Windows.
 - **Signature accent colors**: every desktop gets its own deterministic accent color,
   shown as an edge bar and used across checkboxes and progress, so each desktop is
   recognizable at a glance.
-- **Tick tasks on the overlay**: real checkboxes right on the panel; tick to mark done
-  (strikethrough, saved instantly), untick to undo. A done/total progress bar tracks
-  the day.
+- **No modes, ever**: there is no edit button and no editor window. Every section ends
+  in a permanent "+ add task" line: click it, type, press Enter, and the task is saved
+  and the caret stays put for the next one. Task text is always editable: click any
+  task and type. Same for the theme line and section names.
+- **Capture from anywhere**: `Win+Shift+N` shows the panel for the current desktop and
+  drops the caret straight into its add line, so a thought becomes a task in one
+  keystroke without leaving what you were doing.
+- **Tick tasks on the overlay**: real checkboxes; tick to mark done (strikethrough,
+  saved instantly), untick to undo. A done/total progress bar tracks the day.
 - **Completed tasks, your way**: the eye button (or tray menu) toggles whether done
-  tasks stay visible, struck through under each section, or disappear from view. A
-  "clear completed" action in edit mode sweeps them away when you are ready.
+  tasks stay visible, struck through under each section, or disappear from view.
+  "clear completed" sweeps them away when you are ready.
 - **Undo for every deletion**: deleting a task, a section, or clearing completed shows
-  an Undo strip on the panel for a few seconds. Nothing is lost to a stray click.
-- **Inline editing**: click the pencil (or press `Win+Shift+N`) and the panel itself
-  becomes the editor: rename the theme and sections, add tasks (Enter), delete tasks,
-  add or remove sections. No separate window. The border glows in the desktop's accent
-  color while editing, and sections with nothing pending say so ("all done ✓") instead
-  of disappearing.
+  an Undo strip on the panel for a few seconds. Emptying a task's text deletes it, also
+  undoable. Nothing is lost to a stray click.
 - **Stays out of your way**: never steals keyboard focus (except while you are typing
   in edit mode), no Alt-Tab entry, header controls fade in only on hover, and the
   panel pauses its auto-fade while your mouse is over it.
@@ -63,11 +65,15 @@ powershell -File DesktopHud.ps1 -Uninstall   # removes it
 
 | Hotkey | Action |
 |---|---|
-| `Win+Shift+N` | Open the panel in edit mode for the current desktop |
+| `Win+Shift+N` | Quick add: show the panel and start typing a task |
 | `Win+Shift+H` | Show the panel for the current desktop |
 | `Win+Shift+B` | Toggle the anchor pill |
 
-The tray icon offers the same actions plus Exit; double-click it to edit.
+Inside the panel: `Enter` commits a task and moves on to the next, `Escape` hands focus
+back to the app you were using, `Tab` moves between fields, and hovering a row reveals
+its delete button.
+
+The tray icon offers the same actions plus Exit; double-click it to add a task.
 
 ## How it works
 
@@ -77,9 +83,12 @@ The tray icon offers the same actions plus Exit; double-click it to edit.
   from the same registry area, so renames in Task View show up automatically. No
   undocumented virtual-desktop APIs are used, which is why this survives Windows
   updates that break desktop "pinning" tools.
-- The overlay windows use `WS_EX_TOOLWINDOW` + `WS_EX_NOACTIVATE`: visible on every
-  virtual desktop, absent from Alt-Tab, and unable to steal keyboard focus. The pill
-  is additionally click-through (`WS_EX_TRANSPARENT`).
+- The overlay windows use `WS_EX_TOOLWINDOW`: visible on every virtual desktop and
+  absent from Alt-Tab. The panel deliberately does NOT set `WS_EX_NOACTIVATE`, because
+  it must be able to take focus when you click into a field; `ShowActivated="False"` is
+  what keeps it from stealing focus when it merely appears (verified: showing the panel
+  leaves the foreground window untouched). The pill, which is never typed into, keeps
+  both flags and is click-through (`WS_EX_TRANSPARENT`).
 - UI is WPF with custom control templates (checkboxes, slider, buttons), built and
   driven from PowerShell. The script relaunches itself under Windows PowerShell 5.1
   STA if started from PowerShell 7+.
@@ -91,8 +100,13 @@ The tray icon offers the same actions plus Exit; double-click it to edit.
 
 ```powershell
 powershell -File DesktopHud.ps1 -SelfTest    # environment checks, no UI
-powershell -File DesktopHud.ps1 -SmokeTest   # 6-second full run, exits by itself
+powershell -File DesktopHud.ps1 -SmokeTest   # drives the real capture flow, then exits
 ```
+
+`-SmokeTest` runs against a throwaway notes file in `%TEMP%` (it never touches your
+notes) and asserts the whole loop: add a task through the ghost row, confirm the row
+clears, rename the task in place, add and name a section, delete it, and undo the
+delete. It exits non-zero and prints what broke if any step fails.
 
 A minimal log is written to `hud.log` (gitignored). Single instance is enforced with
 a mutex; a second launch exits quietly.

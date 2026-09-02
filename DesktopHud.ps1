@@ -3,7 +3,7 @@
 # plus an optional tiny always-visible "anchor pill". Notes are keyed by desktop GUID.
 # Built on stable surfaces only: VirtualDesktops registry + documented IVirtualDesktopManager COM.
 #
-# Hotkeys:  Win+Shift+N edit note   Win+Shift+H replay HUD   Win+Shift+B toggle pill
+# Hotkeys:  Win+Shift+N quick-add task   Win+Shift+H show panel   Win+Shift+B toggle pill
 # Usage:    DesktopHud.bat (hidden)  |  -Install / -Uninstall (Startup shortcut)  |  -SelfTest / -SmokeTest
 
 param(
@@ -34,6 +34,11 @@ if ($PSVersionTable.PSEdition -eq 'Core' -or
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $NotesPath = Join-Path $ScriptDir 'notes.json'
 $LogPath   = Join-Path $ScriptDir 'hud.log'
+if ($SmokeTest) {
+    # never let a test touch real notes
+    $NotesPath = Join-Path $env:TEMP 'desktophud_smoke_notes.json'
+    if (Test-Path $NotesPath) { Remove-Item $NotesPath -Force }
+}
 $VdKey     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VirtualDesktops'
 
 function Log([string]$m) {
@@ -98,25 +103,20 @@ namespace HudNative
     public static class Native
     {
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
         [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr(IntPtr h, int i);
         [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] static extern IntPtr SetWindowLongPtr(IntPtr h, int i, IntPtr v);
 
         // WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE: no Alt-Tab entry,
         // never steals keyboard focus, visible on every virtual desktop.
         // clickThrough additionally sets WS_EX_TRANSPARENT so the mouse passes through.
-        public static void SetOverlayStyles(IntPtr h, bool clickThrough)
+        public static void SetOverlayStyles(IntPtr h, bool clickThrough, bool noActivate)
         {
             long ex = (long)GetWindowLongPtr(h, -20);
-            ex |= 0x80000L | 0x80L | 0x8000000L;
+            ex |= 0x80000L | 0x80L;
             if (clickThrough) ex |= 0x20L;
-            SetWindowLongPtr(h, -20, (IntPtr)ex);
-        }
-
-        // NOACTIVATE must be lifted while inline editing so text boxes can take keyboard input
-        public static void SetNoActivate(IntPtr h, bool on)
-        {
-            long ex = (long)GetWindowLongPtr(h, -20);
-            if (on) ex |= 0x8000000L; else ex &= ~0x8000000L;
+            if (noActivate) ex |= 0x8000000L; else ex &= ~0x8000000L;
             SetWindowLongPtr(h, -20, (IntPtr)ex);
         }
     }
@@ -247,7 +247,8 @@ if ($SelfTest) {
 }
 
 # --- single instance ---------------------------------------------------------
-$script:Mutex = New-Object System.Threading.Mutex($false, 'Local\DesktopHudSingleton')
+$mutexName = if ($SmokeTest) { 'Local\DesktopHudSmoke' } else { 'Local\DesktopHudSingleton' }
+$script:Mutex = New-Object System.Threading.Mutex($false, $mutexName)
 if (-not $script:Mutex.WaitOne(0)) {
     Log 'already running, exiting'
     Write-Host 'Desktop HUD is already running.'
@@ -381,6 +382,88 @@ $hudXaml = @"
       </Setter>
     </Style>
 
+    <!-- always-editable text: looks like a label, becomes a field the moment you click it.
+         Tag carries placeholder text, Uid carries the "section:index" address. -->
+    <Style x:Key="TaskBox" TargetType="TextBox">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="{StaticResource Ink}"/>
+      <Setter Property="CaretBrush" Value="{StaticResource Ink}"/>
+      <Setter Property="FontFamily" Value="Segoe UI Variable Text, Segoe UI"/>
+      <Setter Property="FontSize" Value="14"/>
+      <Setter Property="TextWrapping" Value="Wrap"/>
+      <Setter Property="AcceptsReturn" Value="False"/>
+      <Setter Property="Padding" Value="5,3"/>
+      <Setter Property="SelectionOpacity" Value="0.4"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TextBox">
+            <Grid>
+              <Border x:Name="bd" Background="Transparent" CornerRadius="6"/>
+              <TextBlock x:Name="ph" Text="{TemplateBinding Tag}" Foreground="#7C7A86"
+                         FontFamily="{TemplateBinding FontFamily}" FontSize="{TemplateBinding FontSize}"
+                         Margin="{TemplateBinding Padding}" Visibility="Collapsed" IsHitTestVisible="False"/>
+              <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="Text" Value="">
+                <Setter TargetName="ph" Property="Visibility" Value="Visible"/>
+              </Trigger>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#12FFFFFF"/>
+              </Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#24FFFFFF"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <!-- the ghost "+ add task" row that sits permanently at the end of every section -->
+    <Style x:Key="GhostBox" TargetType="TextBox" BasedOn="{StaticResource TaskBox}">
+      <Setter Property="FontSize" Value="13"/>
+    </Style>
+
+    <Style x:Key="TitleBox" TargetType="TextBox" BasedOn="{StaticResource TaskBox}">
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="FontWeight" Value="Bold"/>
+    </Style>
+
+    <Style x:Key="ThemeBox" TargetType="TextBox" BasedOn="{StaticResource TaskBox}">
+      <Setter Property="FontSize" Value="14"/>
+    </Style>
+
+    <!-- checkbox with no label: the task text lives in its own editable field beside it -->
+    <Style x:Key="HudBox" TargetType="CheckBox">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="VerticalAlignment" Value="Top"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="CheckBox">
+            <Border Background="Transparent" Padding="5,6,3,4">
+              <Border x:Name="box" Width="17" Height="17" CornerRadius="5"
+                      BorderThickness="1.5" BorderBrush="{TemplateBinding BorderBrush}"
+                      Background="Transparent">
+                <TextBlock x:Name="tick" Text="&#x2713;" FontSize="11" FontWeight="Bold"
+                           Foreground="#1B1B26" HorizontalAlignment="Center" VerticalAlignment="Center"
+                           Visibility="Collapsed" Margin="0,-1,0,0"/>
+              </Border>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="box" Property="Background" Value="#22FFFFFF"/>
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="box" Property="Background" Value="{Binding BorderBrush, RelativeSource={RelativeSource TemplatedParent}}"/>
+                <Setter TargetName="tick" Property="Visibility" Value="Visible"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <Style x:Key="HudSlider" TargetType="Slider">
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template">
@@ -460,16 +543,12 @@ $hudXaml = @"
                       Minimum="0.3" Maximum="1.0" Margin="0,0,8,0" ToolTip="Overlay opacity"/>
               <Button x:Name="HudEye" Style="{StaticResource GlyphBtn}" FontFamily="Segoe MDL2 Assets"
                       Content="&#xE7B3;" FontSize="13" ToolTip="Show completed tasks"/>
-              <Button x:Name="HudEdit" Style="{StaticResource GlyphBtn}" Content="&#x270E;"
-                      FontSize="13" ToolTip="Edit right here"/>
               <Button x:Name="HudClose" Style="{StaticResource GlyphBtn}" Content="&#x2715;"
                       ToolTip="Hide until next desktop switch"/>
             </StackPanel>
           </Grid>
-          <TextBlock x:Name="HudTheme" FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="14"
-                     Foreground="#5BA8E0" Margin="0,4,0,0" TextWrapping="Wrap"/>
-          <TextBox x:Name="HudThemeBox" Style="{StaticResource HudField}" FontSize="14"
-                   Visibility="Collapsed" Margin="0,8,0,0"/>
+          <TextBox x:Name="HudThemeBox" Style="{StaticResource ThemeBox}" Uid="theme"
+                   Tag="what is this desktop for?" Margin="-5,2,0,0"/>
           <Grid x:Name="HudBarGrid" Margin="0,10,0,0" Height="3">
             <Grid.ColumnDefinitions>
               <ColumnDefinition x:Name="HudBarDone" Width="0*"/>
@@ -502,7 +581,6 @@ $pillXaml = @"
 
 $script:HudWin = [System.Windows.Markup.XamlReader]::Parse($hudXaml)
 $script:HudDesktop = $HudWin.FindName('HudDesktop')
-$script:HudTheme = $HudWin.FindName('HudTheme')
 $script:HudTasks = $HudWin.FindName('HudTasks')
 $script:HudProgress = $HudWin.FindName('HudProgress')
 $script:HudBarGrid = $HudWin.FindName('HudBarGrid')
@@ -516,21 +594,19 @@ $script:AccentBrushObj = New-Object System.Windows.Media.SolidColorBrush(
     [System.Windows.Media.Color]::FromRgb(0x5B, 0xA8, 0xE0))
 $HudWin.FindName('HudAccentBar').Background = $script:AccentBrushObj
 $HudWin.FindName('HudBarFill').Background = $script:AccentBrushObj
-$script:HudTheme.Foreground = $script:AccentBrushObj
 
 $script:PillWin = [System.Windows.Markup.XamlReader]::Parse($pillXaml)
 $script:PillText = $PillWin.FindName('PillText')
 $script:PillBorder = $PillWin.FindName('PillBorder')
 
-# HUD is interactive (tick tasks, drag, slider); pill stays click-through
+# HUD is fully interactive: it must be able to take focus when you click into a field,
+# so it does NOT carry WS_EX_NOACTIVATE. ShowActivated=False is what keeps it from
+# stealing focus when it merely appears. The pill stays click-through and passive.
 $hudH = (New-Object System.Windows.Interop.WindowInteropHelper($HudWin)).EnsureHandle()
-[HudNative.Native]::SetOverlayStyles($hudH, $false)
+[HudNative.Native]::SetOverlayStyles($hudH, $false, $false)
 $script:HudHandle = $hudH
-$script:HudEditMode = $false
-$script:HudTitleBoxes = @()
-$script:HudAddBoxes = @()
 $pillH = (New-Object System.Windows.Interop.WindowInteropHelper($PillWin)).EnsureHandle()
-[HudNative.Native]::SetOverlayStyles($pillH, $true)
+[HudNative.Native]::SetOverlayStyles($pillH, $true, $true)
 
 $script:HudOpacitySlider = $HudWin.FindName('HudOpacity')
 $HudOpacitySlider.Value = $State.settings.hudOpacity
@@ -542,18 +618,22 @@ $HudOpacitySlider.add_ValueChanged({
 })
 $HudOpacitySlider.add_LostMouseCapture({ Save-State })
 $HudWin.FindName('HudClose').add_Click({
-    if ($script:HudEditMode) { Toggle-HudEdit }
     $script:HoldTimer.Stop()
     $script:HudWin.Hide()
 })
-$script:HudEditBtn = $HudWin.FindName('HudEdit')
 $script:HudThemeBox = $HudWin.FindName('HudThemeBox')
 $script:HudRoot = $HudWin.FindName('HudRoot')
 $script:HudEyeBtn = $HudWin.FindName('HudEye')
-$script:HudEditBtn.add_Click({ Toggle-HudEdit })
+$script:HudThemeBox.Foreground = $script:AccentBrushObj
+$script:HudThemeBox.CaretBrush = $script:AccentBrushObj
 $script:HudEyeBtn.add_Click({ Toggle-ShowDone })
-$HudWin.add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape' -and $script:HudEditMode) { Toggle-HudEdit } })
-# drag anywhere on the panel background; controls handle their own clicks first
+$script:HudThemeBox.add_LostFocus({ Commit-Theme })
+$script:HudThemeBox.add_KeyDown({
+    param($s, $e)
+    if ($e.Key -eq 'Return') { Commit-Theme; Move-FocusToFirstAdd; $e.Handled = $true }
+    elseif ($e.Key -eq 'Escape') { Blur-Hud }
+})
+# drag by the panel background; text fields and buttons consume their own clicks first
 $HudWin.add_MouseLeftButtonDown({
     try { $script:HudWin.DragMove() } catch {}
     $script:State.settings.hudX = $script:HudWin.Left
@@ -569,11 +649,7 @@ $HudWin.add_MouseEnter({
 $HudWin.add_MouseLeave({
     $a = New-Object System.Windows.Media.Animation.DoubleAnimation(0.25, (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(300))))
     $script:HudCtrls.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $a)
-    if (-not $script:HudEditMode -and $script:HudWin.IsVisible -and
-        (Get-PendingCount (Get-Note $script:CurrentGuid)) -eq 0) {
-        $script:HoldTimer.Stop()
-        $script:HoldTimer.Start()
-    }
+    Start-IdleFade
 })
 
 # --- HUD show / hide ---------------------------------------------------------
@@ -668,34 +744,105 @@ function Set-HudNote($note) {
     Save-State
 }
 
-# saves what is currently typed in the edit-mode boxes (theme + section titles)
-function Persist-HudEdits {
-    if (-not $script:HudEditMode) { return }
-    $note = Get-Note $script:CurrentGuid
-    $note.theme = $script:HudThemeBox.Text.Trim()
-    for ($i = 0; $i -lt $script:HudTitleBoxes.Count -and $i -lt @($note.sections).Count; $i++) {
-        $note.sections[$i].title = $script:HudTitleBoxes[$i].Text.Trim()
-    }
-    Set-HudNote $note
+# --- addressing: every editable control carries "<section>:<index|title|add>" in Uid --
+function Get-Addr($ctl) {
+    $parts = ([string]$ctl.Uid) -split ':'
+    if ($parts.Count -lt 2) { return $null }
+    return @{ sec = [int]$parts[0]; slot = $parts[1] }
+}
+
+# the panel auto-fades only when idle: nothing pending, not hovered, not being typed in
+function Start-IdleFade {
+    $script:HoldTimer.Stop()
+    if (-not $script:HudWin.IsVisible) { return }
+    if ($script:HudWin.IsMouseOver -or $script:HudWin.IsKeyboardFocusWithin) { return }
+    if ((Get-PendingCount (Get-Note $script:CurrentGuid)) -ne 0) { return }
+    $script:HoldTimer.Start()
+}
+
+function Blur-Hud {
+    # hand keyboard focus back to whatever the user was working in
+    [System.Windows.Input.Keyboard]::ClearFocus()
+    try {
+        $prev = $script:PrevForeground
+        if ($prev -and $prev -ne [IntPtr]::Zero -and $prev -ne $script:HudHandle -and
+            [HudNative.Native]::IsWindow($prev)) {
+            [void][HudNative.Native]::SetForegroundWindow($prev)
+        }
+    } catch {}
+    Start-IdleFade
 }
 
 function Complete-HudTask($cb) {
-    $tag = $cb.Tag
+    $a = Get-Addr $cb
+    if (-not $a) { return }
     $note = Get-Note $script:CurrentGuid
-    if ($tag.sec -ge @($note.sections).Count) { return }
-    $tasks = @($note.sections[$tag.sec].tasks)
-    for ($i = 0; $i -lt $tasks.Count; $i++) {
-        $trim = ([string]$tasks[$i]).TrimStart()
-        if ($cb.IsChecked -and $trim -eq $tag.text) { $tasks[$i] = "x $($tag.text)"; break }
-        if (-not $cb.IsChecked -and $trim -eq "x $($tag.text)") { $tasks[$i] = $tag.text; break }
-    }
-    $note.sections[$tag.sec].tasks = $tasks
+    if ($a.sec -ge @($note.sections).Count) { return }
+    $tasks = @($note.sections[$a.sec].tasks)
+    $i = [int]$a.slot
+    if ($i -lt 0 -or $i -ge $tasks.Count) { return }
+    $body = ([string]$tasks[$i]).TrimStart()
+    if ($body.StartsWith('x ')) { $body = $body.Substring(2) }
+    $tasks[$i] = if ($cb.IsChecked) { "x $body" } else { $body }
+    $note.sections[$a.sec].tasks = $tasks
     Set-HudNote $note
-    Set-DoneStyle $cb
     Update-HudProgress
-    # when the last pending task is ticked, let the panel fade out
-    $script:HoldTimer.Stop()
-    if ((Get-PendingCount $note) -eq 0 -and -not $script:HudEditMode) { $script:HoldTimer.Start() }
+    # hiding completed items changes the list, so rebuild; otherwise just restyle in place
+    if (-not $script:State.settings.showDone) { [void](Render-HudContent) }
+    else {
+        foreach ($t in $script:HudFocusables) {
+            if ([string]$t.Uid -eq [string]$cb.Uid) { Set-TaskDoneStyle $t $cb.IsChecked }
+        }
+    }
+    Start-IdleFade
+}
+
+# commit an edited task's text (called on Enter and on focus loss); no re-render, so
+# the caret stays exactly where the user put it
+function Commit-TaskText($tb) {
+    # a rebuild tears controls out of the tree, which fires LostFocus with a stale
+    # address; ignore those or they would write over the wrong task
+    if ($script:Rendering) { return }
+    $a = Get-Addr $tb
+    if (-not $a) { return }
+    $note = Get-Note $script:CurrentGuid
+    if ($a.sec -ge @($note.sections).Count) { return }
+    $tasks = @($note.sections[$a.sec].tasks)
+    $i = [int]$a.slot
+    if ($i -lt 0 -or $i -ge $tasks.Count) { return }
+    $wasDone = ([string]$tasks[$i]).TrimStart().StartsWith('x ')
+    $new = $tb.Text.Trim()
+    if (-not $new) {
+        # emptying a task deletes it, with undo
+        $raw = [string]$tasks[$i]
+        $list = [System.Collections.ArrayList]$tasks
+        $list.RemoveAt($i)
+        $note.sections[$a.sec].tasks = @($list)
+        Set-HudNote $note
+        Set-HudUndo @{ type = 'task'; sec = $a.sec; idx = $i; text = $raw } 'Task deleted'
+        [void](Render-HudContent)
+        return
+    }
+    $tasks[$i] = if ($wasDone) { "x $new" } else { $new }
+    $note.sections[$a.sec].tasks = $tasks
+    Set-HudNote $note
+}
+
+function Commit-SectionTitle($tb) {
+    if ($script:Rendering) { return }
+    $a = Get-Addr $tb
+    if (-not $a) { return }
+    $note = Get-Note $script:CurrentGuid
+    if ($a.sec -ge @($note.sections).Count) { return }
+    $note.sections[$a.sec].title = $tb.Text.Trim()
+    Set-HudNote $note
+}
+
+function Commit-Theme {
+    $note = Get-Note $script:CurrentGuid
+    $note.theme = $script:HudThemeBox.Text.Trim()
+    Set-HudNote $note
+    Update-Pill
 }
 
 # --- undo (single-level, for destructive actions) ----------------------------
@@ -744,7 +891,6 @@ function Invoke-HudUndo {
 }
 
 function Clear-DoneTasks {
-    Persist-HudEdits
     $note = Get-Note $script:CurrentGuid
     $removed = @{}
     for ($i = 0; $i -lt @($note.sections).Count; $i++) {
@@ -776,52 +922,63 @@ function Toggle-ShowDone {
     if ($script:HudWin.IsVisible) { [void](Render-HudContent) }
 }
 
-function Remove-HudTask([int]$sec, [string]$txt) {
+function Remove-HudTask([int]$sec, [int]$idx) {
     $note = Get-Note $script:CurrentGuid
     if ($sec -ge @($note.sections).Count) { return }
     $tasks = [System.Collections.ArrayList]@($note.sections[$sec].tasks)
-    for ($i = 0; $i -lt $tasks.Count; $i++) {
-        if (([string]$tasks[$i]).TrimStart() -eq $txt) {
-            $raw = [string]$tasks[$i]
-            $tasks.RemoveAt($i)
-            $note.sections[$sec].tasks = @($tasks)
-            Set-HudNote $note
-            Set-HudUndo @{ type = 'task'; sec = $sec; idx = $i; text = $raw } 'Task deleted'
-            [void](Render-HudContent)
-            return
-        }
-    }
+    if ($idx -lt 0 -or $idx -ge $tasks.Count) { return }
+    $raw = [string]$tasks[$idx]
+    $tasks.RemoveAt($idx)
+    $note.sections[$sec].tasks = @($tasks)
+    Set-HudNote $note
+    Set-HudUndo @{ type = 'task'; sec = $sec; idx = $idx; text = $raw } 'Task deleted'
+    [void](Render-HudContent)
 }
 
-function Add-HudTask([int]$sec) {
-    if ($sec -ge $script:HudAddBoxes.Count) { return }
-    $t = $script:HudAddBoxes[$sec].Text.Trim()
-    if (-not $t) { return }
-    Persist-HudEdits
+# focus the control whose Uid matches, once the new visual tree has been laid out
+function Set-FocusByUid([string]$uid) {
+    $act = [System.Action] {
+        foreach ($c in $script:HudFocusables) {
+            if ([string]$c.Uid -eq $script:PendingFocusUid) {
+                $script:HudWin.Activate()
+                [void]$c.Focus()
+                [void][System.Windows.Input.Keyboard]::Focus($c)
+                if ($c -is [System.Windows.Controls.TextBox]) { $c.CaretIndex = $c.Text.Length }
+                break
+            }
+        }
+    }
+    $script:PendingFocusUid = $uid
+    [void]$script:HudWin.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Input, $act)
+}
+
+# Enter on a ghost add-row: append the task, rebuild, and land the caret back in the
+# (now empty) add-row so the next thought can be typed straight away
+function Add-HudTask($tb) {
+    $a = Get-Addr $tb
+    if (-not $a) { return }
+    $t = $tb.Text.Trim()
+    if (-not $t) { Blur-Hud; return }
     $note = Get-Note $script:CurrentGuid
-    $note.sections[$sec].tasks = @(@($note.sections[$sec].tasks) + $t)
+    if ($a.sec -ge @($note.sections).Count) { return }
+    $note.sections[$a.sec].tasks = @(@($note.sections[$a.sec].tasks) + $t)
     Set-HudNote $note
+    $tb.Text = ''
     [void](Render-HudContent)
-    if ($sec -lt $script:HudAddBoxes.Count) { [void]$script:HudAddBoxes[$sec].Focus() }
+    Set-FocusByUid "$($a.sec):add"
 }
 
 function Add-HudSection {
-    Persist-HudEdits
     $note = Get-Note $script:CurrentGuid
     $secs = @($note.sections)
-    $secs += @{ title = "Section $($secs.Count + 1)"; tasks = @() }
+    $secs += @{ title = ''; tasks = @() }
     $note.sections = $secs
     Set-HudNote $note
     [void](Render-HudContent)
-    if ($script:HudTitleBoxes.Count) {
-        $box = $script:HudTitleBoxes[$script:HudTitleBoxes.Count - 1]
-        [void]$box.Focus()
-        $box.SelectAll()
-    }
+    Set-FocusByUid "$($secs.Count - 1):title"
 }
 
 function Remove-HudSection([int]$sec) {
-    Persist-HudEdits
     $note = Get-Note $script:CurrentGuid
     $secs = [System.Collections.ArrayList]@($note.sections)
     if ($sec -ge $secs.Count) { return }
@@ -835,9 +992,10 @@ function Remove-HudSection([int]$sec) {
 }
 
 # one task row: [delete (edit mode)][checkbox + text]
-function New-HudTaskRow([int]$si, [string]$raw, [bool]$done) {
+function New-HudTaskRow([int]$si, [int]$idx, [string]$raw, [bool]$done) {
     $trimmed = $raw.TrimStart()
     $text = if ($done) { $trimmed.Substring(2) } else { $trimmed }
+    $addr = "$($si):$idx"
 
     $row = New-Object System.Windows.Controls.DockPanel
     $row.Margin = New-Object System.Windows.Thickness(0, 1, 0, 0)
@@ -849,50 +1007,74 @@ function New-HudTaskRow([int]$si, [string]$raw, [bool]$done) {
     $del.Width = 22
     $del.Height = 22
     $del.VerticalAlignment = 'Center'
+    $del.Opacity = 0
     $del.ToolTip = 'Delete task'
-    $del.Tag = @{ sec = $si; text = $trimmed }
-    $del.Visibility = if ($script:HudEditMode) { 'Visible' } else { 'Collapsed' }
-    $del.add_Click({ param($s, $e) Remove-HudTask ([int]$s.Tag.sec) ([string]$s.Tag.text) })
+    $del.Uid = $addr
+    $del.add_Click({
+        param($s, $e)
+        $a = Get-Addr $s
+        Remove-HudTask $a.sec ([int]$a.slot)
+    })
     [System.Windows.Controls.DockPanel]::SetDock($del, 'Right')
 
     $cb = New-Object System.Windows.Controls.CheckBox
-    $cb.Style = $script:HudWin.Resources['HudCheck']
+    $cb.Style = $script:HudWin.Resources['HudBox']
     $cb.BorderBrush = $script:AccentBrushObj
     $cb.IsChecked = $done
-    $cb.Tag = @{ sec = $si; text = $text }
-    $tbx = New-Object System.Windows.Controls.TextBlock
-    $tbx.Text = $text
-    $tbx.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Variable Text, Segoe UI')
-    $tbx.FontSize = 14
-    $tbx.TextWrapping = 'Wrap'
-    $cb.Content = $tbx
-    Set-DoneStyle $cb
+    $cb.Uid = $addr
+    $cb.ToolTip = if ($done) { 'Mark as not done' } else { 'Mark as done' }
     $cb.add_Click({ param($s, $e) Complete-HudTask $s })
+    [System.Windows.Controls.DockPanel]::SetDock($cb, 'Left')
+
+    # the task text IS the editor: click it and type, no mode to enter
+    $tb = New-Object System.Windows.Controls.TextBox
+    $tb.Style = $script:HudWin.Resources['TaskBox']
+    $tb.Text = $text
+    $tb.Uid = $addr
+    $tb.VerticalAlignment = 'Center'
+    Set-TaskDoneStyle $tb $done
+    $tb.add_LostFocus({ param($s, $e) Commit-TaskText $s })
+    $tb.add_KeyDown({
+        param($s, $e)
+        if ($e.Key -eq 'Return') {
+            Commit-TaskText $s
+            $a = Get-Addr $s
+            Set-FocusByUid "$($a.sec):add"
+            $e.Handled = $true
+        } elseif ($e.Key -eq 'Escape') { Blur-Hud }
+    })
+
+    # the delete affordance appears only for the row under the pointer
+    $row.Tag = $del
+    $row.add_MouseEnter({ param($s, $e) $s.Tag.Opacity = 1 })
+    $row.add_MouseLeave({ param($s, $e) $s.Tag.Opacity = 0 })
 
     [void]$row.Children.Add($del)
     [void]$row.Children.Add($cb)
+    [void]$row.Children.Add($tb)
+    $script:HudFocusables += $tb
     return $row
 }
 
 # rebuilds the HUD content (sections, tasks, edit-mode widgets); returns the pending count
 function Render-HudContent {
     $note = Get-Note $script:CurrentGuid
+    $script:Rendering = $true
     $script:HudTasks.Children.Clear()
-    $script:HudTitleBoxes = @()
-    $script:HudAddBoxes = @()
+    $script:HudFocusables = @()
     $secs = @($note.sections)
     $glyphStyle = $script:HudWin.Resources['GlyphBtn']
     $softStyle = $script:HudWin.Resources['SoftBtn']
-    $fieldStyle = $script:HudWin.Resources['HudField']
-    $checkStyle = $script:HudWin.Resources['HudCheck']
+    $titleStyle = $script:HudWin.Resources['TitleBox']
+    $ghostStyle = $script:HudWin.Resources['GhostBox']
     $accentBrush = $script:AccentBrushObj
 
     for ($si = 0; $si -lt $secs.Count; $si++) {
         $sec = $secs[$si]
         $topGap = if ($si -eq 0) { 0.0 } else { 14.0 }
 
-        if ($script:HudEditMode) {
-            # editable section title with a remove-section button
+        # a lone untitled section needs no heading; once there are two, both get one
+        if ($secs.Count -gt 1 -or ([string]$sec.title).Trim()) {
             $trow = New-Object System.Windows.Controls.DockPanel
             $trow.Margin = New-Object System.Windows.Thickness(0, $topGap, 0, 0)
             $rem = New-Object System.Windows.Controls.Button
@@ -901,115 +1083,93 @@ function Render-HudContent {
             $rem.FontSize = 10
             $rem.Width = 22
             $rem.Height = 22
-            $rem.ToolTip = 'Remove this section (and its tasks)'
-            $rem.Tag = $si
-            $rem.add_Click({ param($s, $e) Remove-HudSection ([int]$s.Tag) })
+            $rem.Opacity = 0
+            $rem.ToolTip = 'Delete this section and its tasks'
+            $rem.Uid = "$($si):sec"
+            $rem.add_Click({ param($s, $e) Remove-HudSection ((Get-Addr $s).sec) })
             [System.Windows.Controls.DockPanel]::SetDock($rem, 'Right')
+
             $tb = New-Object System.Windows.Controls.TextBox
-            $tb.Style = $fieldStyle
-            $tb.Text = [string]$sec.title
-            $tb.FontWeight = 'SemiBold'
-            $tb.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
-            $tb.ToolTip = 'Section title'
-            $script:HudTitleBoxes += $tb
+            $tb.Style = $titleStyle
+            $tb.Text = ([string]$sec.title)
+            $tb.Tag = 'section name'
+            $tb.Uid = "$($si):title"
+            $tb.Foreground = $accentBrush
+            $tb.CaretBrush = $accentBrush
+            $tb.add_LostFocus({ param($s, $e) Commit-SectionTitle $s })
+            $tb.add_KeyDown({
+                param($s, $e)
+                if ($e.Key -eq 'Return') {
+                    Commit-SectionTitle $s
+                    Set-FocusByUid "$((Get-Addr $s).sec):add"
+                    $e.Handled = $true
+                } elseif ($e.Key -eq 'Escape') { Blur-Hud }
+            })
+            $script:HudFocusables += $tb
+
+            $trow.Tag = $rem
+            $trow.add_MouseEnter({ param($s, $e) $s.Tag.Opacity = 1 })
+            $trow.add_MouseLeave({ param($s, $e) $s.Tag.Opacity = 0 })
             [void]$trow.Children.Add($rem)
             [void]$trow.Children.Add($tb)
             [void]$script:HudTasks.Children.Add($trow)
-        } elseif (([string]$sec.title).Trim() -or $secs.Count -gt 1) {
-            $tl = New-Object System.Windows.Controls.TextBlock
-            $tl.Text = if (([string]$sec.title).Trim()) { ([string]$sec.title).ToUpper() } else { "SECTION $($si + 1)" }
-            $tl.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Variable Text, Segoe UI')
-            $tl.FontSize = 11
-            $tl.FontWeight = 'Bold'
-            $tl.Opacity = 0.9
-            $tl.Foreground = $accentBrush
-            $tl.Margin = New-Object System.Windows.Thickness(6, $topGap, 0, 2)
-            [void]$script:HudTasks.Children.Add($tl)
         }
 
-        $pending = @(@($sec.tasks) | Where-Object { $_ -and -not ([string]$_).TrimStart().StartsWith('x ') })
-        $doneTasks = @(@($sec.tasks) | Where-Object { $_ -and ([string]$_).TrimStart().StartsWith('x ') })
-        foreach ($t in $pending) {
-            [void]$script:HudTasks.Children.Add((New-HudTaskRow $si ([string]$t) $false))
-        }
-        if ($script:State.settings.showDone) {
-            foreach ($t in $doneTasks) {
-                [void]$script:HudTasks.Children.Add((New-HudTaskRow $si ([string]$t) $true))
-            }
-        }
-        # a saved section with nothing pending should not look like it vanished
-        if (-not $script:HudEditMode -and $pending.Count -eq 0 -and
-            (([string]$sec.title).Trim() -or $secs.Count -gt 1) -and
-            -not ($script:State.settings.showDone -and $doneTasks.Count -gt 0)) {
-            $es = New-Object System.Windows.Controls.TextBlock
-            $es.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Variable Text, Segoe UI')
-            $es.FontSize = 12
-            $es.FontStyle = 'Italic'
-            $es.Opacity = 0.7
-            $es.Foreground = New-Brush 0x9A 0x98 0xA4
-            $es.Margin = New-Object System.Windows.Thickness(6, 3, 0, 0)
-            $es.Text = if ($doneTasks.Count -gt 0) { "all done $([char]0x2713)" } else { 'no tasks yet' }
-            [void]$script:HudTasks.Children.Add($es)
+        # rows keep their real index in the stored list, so edits address the right task
+        $all = @($sec.tasks)
+        for ($ti = 0; $ti -lt $all.Count; $ti++) {
+            $raw = [string]$all[$ti]
+            if (-not $raw) { continue }
+            $isDone = $raw.TrimStart().StartsWith('x ')
+            if ($isDone -and -not $script:State.settings.showDone) { continue }
+            [void]$script:HudTasks.Children.Add((New-HudTaskRow $si $ti $raw $isDone))
         }
 
-        if ($script:HudEditMode) {
-            # per-section add-task row
-            $arow = New-Object System.Windows.Controls.DockPanel
-            $arow.Margin = New-Object System.Windows.Thickness(0, 8, 0, 0)
-            $abtn = New-Object System.Windows.Controls.Button
-            $abtn.Style = $softStyle
-            $abtn.Content = 'Add'
-            $abtn.Tag = $si
-            $abtn.add_Click({ param($s, $e) Add-HudTask ([int]$s.Tag) })
-            [System.Windows.Controls.DockPanel]::SetDock($abtn, 'Right')
-            $abox = New-Object System.Windows.Controls.TextBox
-            $abox.Style = $fieldStyle
-            $abox.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
-            $abox.ToolTip = 'New task, Enter to add'
-            $abox.Tag = $si
-            $abox.add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return') { Add-HudTask ([int]$s.Tag) } })
-            $script:HudAddBoxes += $abox
-            [void]$arow.Children.Add($abtn)
-            [void]$arow.Children.Add($abox)
-            [void]$script:HudTasks.Children.Add($arow)
-        }
+        # the always-present capture line: this is how tasks get created
+        $abox = New-Object System.Windows.Controls.TextBox
+        $abox.Style = $ghostStyle
+        $abox.Tag = if ($all.Count) { '+  add task' } else { '+  add your first task' }
+        $abox.Uid = "$($si):add"
+        $abox.Margin = New-Object System.Windows.Thickness(27, 2, 0, 0)
+        $abox.add_KeyDown({
+            param($s, $e)
+            if ($e.Key -eq 'Return') { Add-HudTask $s; $e.Handled = $true }
+            elseif ($e.Key -eq 'Escape') { $s.Text = ''; Blur-Hud }
+        })
+        $script:HudFocusables += $abox
+        [void]$script:HudTasks.Children.Add($abox)
     }
 
-    if ($script:HudEditMode) {
-        $erow = New-Object System.Windows.Controls.StackPanel
-        $erow.Orientation = 'Horizontal'
-        $erow.Margin = New-Object System.Windows.Thickness(0, 12, 0, 0)
-        $sbtn = New-Object System.Windows.Controls.Button
-        $sbtn.Style = $softStyle
-        $sbtn.Content = '+ section'
-        $sbtn.add_Click({ Add-HudSection })
-        [void]$erow.Children.Add($sbtn)
-        $anyDone = $false
-        foreach ($s in $secs) {
-            foreach ($t in @($s.tasks)) {
-                if ($t -and ([string]$t).TrimStart().StartsWith('x ')) { $anyDone = $true }
-            }
+    # footer: add a section, and sweep away completed work when there is some
+    $erow = New-Object System.Windows.Controls.StackPanel
+    $erow.Orientation = 'Horizontal'
+    $erow.Margin = New-Object System.Windows.Thickness(0, 10, 0, 0)
+    $erow.Opacity = 0.55
+    $sbtn = New-Object System.Windows.Controls.Button
+    $sbtn.Style = $softStyle
+    $sbtn.Content = '+ section'
+    $sbtn.ToolTip = 'Group tasks under a heading'
+    $sbtn.add_Click({ Add-HudSection })
+    [void]$erow.Children.Add($sbtn)
+    $anyDone = $false
+    foreach ($s in $secs) {
+        foreach ($t in @($s.tasks)) {
+            if ($t -and ([string]$t).TrimStart().StartsWith('x ')) { $anyDone = $true }
         }
-        if ($anyDone) {
-            $cbtn = New-Object System.Windows.Controls.Button
-            $cbtn.Style = $softStyle
-            $cbtn.Content = 'clear completed'
-            $cbtn.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
-            $cbtn.ToolTip = 'Delete all completed tasks (undoable)'
-            $cbtn.add_Click({ Clear-DoneTasks })
-            [void]$erow.Children.Add($cbtn)
-        }
-        [void]$script:HudTasks.Children.Add($erow)
-        $hint = New-Object System.Windows.Controls.TextBlock
-        $hint.Text = 'changes save automatically'
-        $hint.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe UI Variable Text, Segoe UI')
-        $hint.FontSize = 10
-        $hint.FontStyle = 'Italic'
-        $hint.Opacity = 0.7
-        $hint.Foreground = New-Brush 0x9A 0x98 0xA4
-        $hint.Margin = New-Object System.Windows.Thickness(6, 8, 0, 0)
-        [void]$script:HudTasks.Children.Add($hint)
     }
+    if ($anyDone) {
+        $cbtn = New-Object System.Windows.Controls.Button
+        $cbtn.Style = $softStyle
+        $cbtn.Content = 'clear completed'
+        $cbtn.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
+        $cbtn.ToolTip = 'Delete all completed tasks (undoable)'
+        $cbtn.add_Click({ Clear-DoneTasks })
+        [void]$erow.Children.Add($cbtn)
+    }
+    $erow.Tag = $erow
+    $erow.add_MouseEnter({ param($s, $e) $s.Opacity = 1 })
+    $erow.add_MouseLeave({ param($s, $e) $s.Opacity = 0.55 })
+    [void]$script:HudTasks.Children.Add($erow)
 
     if ($script:UndoData -and $script:UndoData.guid -eq $script:CurrentGuid) {
         $ub = New-Object System.Windows.Controls.Border
@@ -1038,58 +1198,27 @@ function Render-HudContent {
     }
 
     Update-HudProgress
+    $script:Rendering = $false
     return (Get-PendingCount $note)
 }
 
-function Toggle-HudEdit {
-    if (-not $script:HudEditMode) {
-        $script:HudEditMode = $true
-        $script:HoldTimer.Stop()
-        [HudNative.Native]::SetNoActivate($script:HudHandle, $false)
-        $note = Get-Note $script:CurrentGuid
-        $script:HudThemeBox.Text = $note.theme
-        $script:HudTheme.Visibility = 'Collapsed'
-        $script:HudThemeBox.Visibility = 'Visible'
-        $script:HudEditBtn.Content = [string][char]0x2713
-        $script:HudEditBtn.ToolTip = 'Done editing'
-        $script:HudRoot.BorderBrush = $script:AccentBrushObj
-        [void](Render-HudContent)
-        $script:HudWin.Activate()
-        if ($script:HudAddBoxes.Count) { [void]$script:HudAddBoxes[0].Focus() }
-    } else {
-        Persist-HudEdits
-        $script:HudEditMode = $false
-        $note = Get-Note $script:CurrentGuid
-        if ($note.theme) { $script:HudTheme.Text = $note.theme }
-        else { $script:HudTheme.Text = 'No note yet. Click the pencil to set the theme.' }
-        $script:HudTheme.Visibility = 'Visible'
-        $script:HudThemeBox.Visibility = 'Collapsed'
-        $script:HudEditBtn.Content = [string][char]0x270E
-        $script:HudEditBtn.ToolTip = 'Edit right here'
-        $script:HudRoot.BorderBrush = New-Object System.Windows.Media.SolidColorBrush(
-            [System.Windows.Media.Color]::FromArgb(0x26, 0xFF, 0xFF, 0xFF))
-        [HudNative.Native]::SetNoActivate($script:HudHandle, $true)
-        Update-Pill
-        $pendingLeft = Render-HudContent
-        $script:HoldTimer.Stop()
-        if ($pendingLeft -eq 0) { $script:HoldTimer.Start() }
-    }
+# quick capture: show the panel and drop the caret straight into the first add line
+function Move-FocusToFirstAdd {
+    Set-FocusByUid '0:add'
 }
 
-# hotkey / tray entry point: bring up the HUD already in edit mode
 function Open-HudEditor {
     Show-Hud
-    if (-not $script:HudEditMode) { Toggle-HudEdit }
+    $script:HoldTimer.Stop()
+    Move-FocusToFirstAdd
 }
 
 function Show-Hud {
     if ($script:CurrentGuid -eq [guid]::Empty) { return }
-    if ($script:HudEditMode) { Toggle-HudEdit }
     Set-HudAccent
     $note = Get-Note $script:CurrentGuid
     $script:HudDesktop.Text = Get-DesktopName $script:CurrentGuid
-    if ($note.theme) { $script:HudTheme.Text = $note.theme }
-    else { $script:HudTheme.Text = 'No note yet. Click the pencil to set the theme.' }
+    $script:HudThemeBox.Text = [string]$note.theme
     $pendingCount = Render-HudContent
     $script:HoldTimer.Stop()
     $script:HudWin.Show()
@@ -1139,16 +1268,15 @@ function Update-Pill {
 }
 
 # --- task styling ------------------------------------------------------------
-function Set-DoneStyle($cb) {
-    $tbx = $cb.Content
-    if ($cb.IsChecked) {
-        $tbx.TextDecorations = [System.Windows.TextDecorations]::Strikethrough
-        $tbx.Foreground = New-Brush 0x9A 0x98 0xA4
-        $tbx.Opacity = 0.75
+function Set-TaskDoneStyle($tb, [bool]$done) {
+    if ($done) {
+        $tb.TextDecorations = [System.Windows.TextDecorations]::Strikethrough
+        $tb.Foreground = New-Brush 0x9A 0x98 0xA4
+        $tb.Opacity = 0.75
     } else {
-        $tbx.TextDecorations = $null
-        $tbx.Foreground = New-Brush 0xF5 0xF3 0xEF
-        $tbx.Opacity = 1.0
+        $tb.TextDecorations = $null
+        $tb.Foreground = New-Brush 0xF5 0xF3 0xEF
+        $tb.Opacity = 1.0
     }
 }
 
@@ -1169,9 +1297,11 @@ $script:HotWin.add_Pressed({
         }
     } catch { Log "hotkey handler error: $_" }
 })
-if (-not $HotWin.Register(1, 0xC, 0x4E)) { Log 'WARN: Win+Shift+N registration failed' }
-if (-not $HotWin.Register(2, 0xC, 0x48)) { Log 'WARN: Win+Shift+H registration failed' }
-if (-not $HotWin.Register(3, 0xC, 0x42)) { Log 'WARN: Win+Shift+B registration failed' }
+if (-not $SmokeTest) {
+    if (-not $HotWin.Register(1, 0xC, 0x4E)) { Log 'WARN: Win+Shift+N registration failed' }
+    if (-not $HotWin.Register(2, 0xC, 0x48)) { Log 'WARN: Win+Shift+H registration failed' }
+    if (-not $HotWin.Register(3, 0xC, 0x42)) { Log 'WARN: Win+Shift+B registration failed' }
+}
 
 # --- tray icon ---------------------------------------------------------------
 $bmp = New-Object System.Drawing.Bitmap 16, 16
@@ -1189,8 +1319,8 @@ $Tray.Text = 'Desktop HUD'
 $Tray.Visible = $true
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
-[void]$menu.Items.Add('Edit note  (Win+Shift+N)', $null, { Open-HudEditor })
-[void]$menu.Items.Add('Show HUD  (Win+Shift+H)', $null, { Show-Hud })
+[void]$menu.Items.Add('Add task  (Win+Shift+N)', $null, { Open-HudEditor })
+[void]$menu.Items.Add('Show panel  (Win+Shift+H)', $null, { Show-Hud })
 [void]$menu.Items.Add('Toggle pill  (Win+Shift+B)', $null, {
     $script:State.settings.pill = -not $script:State.settings.pill
     Save-State
@@ -1211,10 +1341,14 @@ $script:PollTimer = New-Object System.Windows.Threading.DispatcherTimer
 $PollTimer.Interval = [TimeSpan]::FromMilliseconds(400)
 $PollTimer.add_Tick({
     try {
+        # remember what the user was working in, so Escape can hand focus back
+        $fg = [HudNative.Native]::GetForegroundWindow()
+        if ($fg -ne [IntPtr]::Zero -and $fg -ne $script:HudHandle) { $script:PrevForeground = $fg }
+
         $g = Get-CurrentDesktopGuid
         if ($g -ne [guid]::Empty -and $g -ne $script:CurrentGuid) {
-            # leaving a desktop while inline-editing: save against the old desktop first
-            if ($script:HudEditMode) { Toggle-HudEdit }
+            # commit anything half-typed against the desktop it belongs to
+            if ($script:HudWin.IsKeyboardFocusWithin) { [System.Windows.Input.Keyboard]::ClearFocus() }
             $script:UndoData = $null
             $script:CurrentGuid = $g
             Update-Pill
@@ -1229,20 +1363,62 @@ $script:App = New-Object System.Windows.Application
 $App.ShutdownMode = 'OnExplicitShutdown'
 
 if ($SmokeTest) {
-    # step 1: open editor (exercises checklist build), step 2: close it (exercises save), step 3: exit
+    # exercises the real capture flow end to end against a throwaway notes file
     $script:SmokeStep = 0
+    $script:SmokeFail = @()
     $smoke = New-Object System.Windows.Threading.DispatcherTimer
-    $smoke.Interval = [TimeSpan]::FromSeconds(2)
+    $smoke.Interval = [TimeSpan]::FromMilliseconds(900)
     $smoke.add_Tick({
         $script:SmokeStep++
         try {
             switch ($script:SmokeStep) {
-                1 { Open-HudEditor }
-                2 { if ($script:HudEditMode) { Toggle-HudEdit } }
+                1 { Show-Hud }
+                2 {
+                    # type into the ghost add-row and commit, exactly as Enter does
+                    $box = $script:HudFocusables | Where-Object { $_.Uid -eq '0:add' } | Select-Object -First 1
+                    if (-not $box) { $script:SmokeFail += 'no add-row rendered'; break }
+                    $box.Text = 'smoke task one'
+                    Add-HudTask $box
+                }
+                3 {
+                    $note = Get-Note $script:CurrentGuid
+                    if (@($note.sections[0].tasks) -notcontains 'smoke task one') { $script:SmokeFail += 'task not stored' }
+                    $box2 = $script:HudFocusables | Where-Object { $_.Uid -eq '0:add' } | Select-Object -First 1
+                    if (-not $box2) { $script:SmokeFail += 'add-row missing after add' }
+                    elseif ($box2.Text -ne '') { $script:SmokeFail += 'add-row not cleared' }
+                    # rename it in place
+                    $tb = $script:HudFocusables | Where-Object { $_.Uid -like '0:*' -and $_.Text -eq 'smoke task one' } | Select-Object -First 1
+                    if (-not $tb) { $script:SmokeFail += 'task row not editable'; break }
+                    $tb.Text = 'smoke task renamed'
+                    Commit-TaskText $tb
+                }
+                4 {
+                    $note = Get-Note $script:CurrentGuid
+                    if (@($note.sections[0].tasks) -notcontains 'smoke task renamed') { $script:SmokeFail += 'rename not stored' }
+                    Add-HudSection
+                }
+                5 {
+                    $note = Get-Note $script:CurrentGuid
+                    if (@($note.sections).Count -lt 2) { $script:SmokeFail += 'section not added' }
+                    $t = $script:HudFocusables | Where-Object { $_.Uid -eq '1:title' } | Select-Object -First 1
+                    if (-not $t) { $script:SmokeFail += 'new section title not focusable' }
+                    else { $t.Text = 'Smoke Section'; Commit-SectionTitle $t }
+                }
+                6 {
+                    $note = Get-Note $script:CurrentGuid
+                    if ([string]$note.sections[1].title -ne 'Smoke Section') { $script:SmokeFail += 'section title not stored' }
+                    Remove-HudSection 1
+                }
+                7 {
+                    if (-not $script:UndoData) { $script:SmokeFail += 'undo not offered' }
+                    Invoke-HudUndo
+                    $note = Get-Note $script:CurrentGuid
+                    if (@($note.sections).Count -lt 2) { $script:SmokeFail += 'undo did not restore section' }
+                }
                 default { $script:App.Shutdown() }
             }
         } catch {
-            Log "SMOKE FAIL: $_"
+            $script:SmokeFail += "exception at step $($script:SmokeStep): $_"
             $script:App.Shutdown()
         }
     })
@@ -1262,4 +1438,11 @@ try {
     try { $script:Mutex.ReleaseMutex() } catch {}
     Log 'stopped'
 }
-if ($SmokeTest) { Write-Host 'SMOKE OK' }
+if ($SmokeTest) {
+    if ($script:SmokeFail -and $script:SmokeFail.Count) {
+        Write-Host "SMOKE FAILED:"
+        $script:SmokeFail | ForEach-Object { Write-Host "  - $_" }
+        exit 1
+    }
+    Write-Host 'SMOKE OK (capture, rename, section add/delete, undo all verified)'
+}
